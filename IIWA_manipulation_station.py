@@ -1,0 +1,346 @@
+import os
+import time
+
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import numpy as np
+import functools
+
+from pydrake.all import (
+    MeshcatVisualizerParams, ConstantVectorSource, Parser, Role, LeafSystem,
+    JointStiffnessController, RotationMatrix, PlanarJoint, FixedOffsetFrame,
+    ConstantVectorSource, PiecewisePolynomial, TrajectorySource, Multiplexer,
+    PiecewisePose, AbstractValue
+)
+from pydrake.common import FindResourceOrThrow
+from pydrake.geometry import MeshcatVisualizer, StartMeshcat
+from pydrake.geometry.render import (
+    ClippingRange,
+    ColorRenderCamera,
+    DepthRange,
+    DepthRenderCamera,
+    RenderCameraCore,
+    RenderLabel,
+    MakeRenderEngineVtk,
+    RenderEngineVtkParams,
+)
+from pydrake.math import RigidTransform, RollPitchYaw
+from pydrake.multibody.parsing import Parser
+from pydrake.multibody.plant import AddMultibodyPlantSceneGraph
+from pydrake.multibody.tree import BodyIndex
+from pydrake.systems.analysis import Simulator
+from pydrake.systems.framework import DiagramBuilder
+from pydrake.systems.sensors import (
+        CameraInfo,
+        RgbdSensor,
+)
+from pydrake.examples.manipulation_station import (
+        IiwaCollisionModel,
+        ManipulationStation,
+)
+from manipulation.scenarios import (
+        MakeManipulationStation, AddIiwaDifferentialIK
+)
+from manipulation.meshcat_utils import AddMeshcatTriad
+from Controllers import PoseTrajectorySource, TorqueController
+
+def prefinalize_callback(plant):
+    return
+
+class IIWA_manipulation_station:
+    def __init__(self, is_visualizing, meshcat_instance=None, traj=None, default_iiwa_config=None, default_cube_config=None):
+        model_directives = open("model_directives.txt", "r").read()
+
+        builder = DiagramBuilder()
+        self.station = MakeManipulationStation(
+                model_directives, 
+                time_step=0.005, 
+                package_xmls=["./package.xml"], 
+                prefinalize_callback=prefinalize_callback
+        )
+        builder.AddSystem(self.station)
+
+        self.plant = self.station.GetSubsystemByName("plant")
+
+        self.scene_graph = self.station.GetSubsystemByName("scene_graph")
+
+        # scene graph query output port.
+        self.query_output_port = self.scene_graph.GetOutputPort("query")
+
+        # wsg controller
+        wsg_position = builder.AddSystem(ConstantVectorSource([0.01]))
+        builder.Connect(wsg_position.get_output_port(),
+                self.station.GetInputPort("wsg_position"))
+
+        self.is_visualizing = is_visualizing
+        if is_visualizing:
+            self.meshcat = meshcat_instance
+            params = MeshcatVisualizerParams()
+            params.delete_on_initialization_event = False
+            params.role = Role.kIllustration # kProximity for collisions, kIllustration for visual
+            self.visualizer = MeshcatVisualizer.AddToBuilder(
+                    builder, self.station.GetOutputPort("query_object"), self.meshcat, params)
+
+        # setting up controller
+        if traj is not None:
+            ### config version
+            #iiwa_controller = self.station.GetSubsystemByName("iiwa_controller")
+
+            #N = 7
+            #positions_to_state = builder.AddSystem(Multiplexer([N, N]))
+            ## zero velocity
+            #zeros = builder.AddSystem(ConstantVectorSource([0]*N))
+            #builder.Connect(
+            #        zeros.get_output_port(0),
+            #        positions_to_state.get_input_port(1)
+            #)
+            #builder.Connect(
+            #        positions_to_state.get_output_port(),
+            #        iiwa_controller.get_input_port_desired_state()
+            #        #self.station.GetInputPort("desired_state")
+            #)
+            #traj_source = builder.AddSystem(TrajectorySource(traj))
+            #builder.Connect(
+            #        traj_source.get_output_port(),
+            #        positions_to_state.get_input_port(0)
+            #)
+            ###
+
+            #### not sure config version
+            #traj_source = builder.AddSystem(TrajectorySource(traj))
+            #builder.Connect(
+            #        traj_source.get_output_port(),
+            #        self.station.GetInputPort("iiwa_position")
+            #)
+            ###
+
+            ### pose version
+            traj_source = builder.AddSystem(PoseTrajectorySource(traj))
+            controller_plant = self.station.GetSubsystemByName("iiwa_controller").get_multibody_plant_for_control()
+            self.controller = AddIiwaDifferentialIK(
+                    builder,
+                    controller_plant,
+                    frame=controller_plant.GetFrameByName("body")
+            )
+            builder.Connect(traj_source.get_output_port(),
+                    self.controller.get_input_port(0)
+            )
+            builder.Connect(self.station.GetOutputPort("iiwa_state_estimated"),
+                    self.controller.GetInputPort("robot_state")
+            )
+            builder.Connect(self.controller.get_output_port(),
+                    self.station.GetInputPort("iiwa_position")
+            )
+            ###
+
+        self.diagram = builder.Build()
+
+        # contexts
+        self.context_diagram = self.diagram.CreateDefaultContext()
+        self.context_station = self.diagram.GetSubsystemContext(
+                self.station, self.context_diagram)
+        self.context_scene_graph = self.station.GetSubsystemContext(
+                self.scene_graph, self.context_station)
+        self.context_plant = self.station.GetMutableSubsystemContext(
+                self.plant, self.context_station)
+
+        self.world_frame = self.plant.world_frame()
+        self.gripper_frame = self.plant.GetFrameByName("body")
+        self.cube_frame = self.plant.GetFrameByName("base_link")
+
+        iiwa = self.plant.GetModelInstanceByName("iiwa")
+        if default_iiwa_config is None:
+            default_iiwa_config = np.array([-1.57, 0.1, 0, -1.2, 0, 1.6, 0])
+        self.plant.SetDefaultPositions(
+                iiwa,
+                default_iiwa_config
+        )
+        if default_cube_config is None:
+            default_cube_pose = RigidTransform(RotationMatrix(), np.array([0, -0.4, 0.39]))
+        else:
+            default_cube_pose = self.CubeConfigToTransform(default_cube_config)
+        self.plant.SetDefaultFreeBodyPose(
+                self.plant.GetBodyByName("base_link"),
+                default_cube_pose
+        )
+
+        # mark initial configuration
+        self.iiwa_q0 = self.plant.GetPositions(self.context_plant, iiwa)
+        self.cube_q0 = self.GetCubeConfig()
+
+        if traj is None:
+            iiwa_controller = self.station.GetSubsystemByName("iiwa_controller")
+            if default_iiwa_config is None:
+                q0 = np.array([-1.57, 0.1, 0, -1.2, 0, 1.6, 0])
+            else:
+                q0 = default_iiwa_config
+            x0 = np.hstack((q0, 0*q0))
+            self.SetIiwaConfiguration(q0)
+            iiwa_controller.GetInputPort('desired_state').FixValue(
+                    iiwa_controller.GetMyMutableContextFromRoot(self.context_diagram), x0)
+
+        self.context_diagram = self.diagram.CreateDefaultContext()
+        self.context_station = self.diagram.GetSubsystemContext(
+                self.station, self.context_diagram)
+        self.context_scene_graph = self.station.GetSubsystemContext(
+                self.scene_graph, self.context_station)
+        self.context_plant = self.station.GetMutableSubsystemContext(
+                self.plant, self.context_station)
+
+        self.simulator = Simulator(self.diagram)
+
+    def CubeConfigToTransform(self, cube_q):
+        R_WCube = RotationMatrix.MakeZRotation(cube_q[2])
+        p_WCube = [cube_q[0], cube_q[1], self.get_X_WCube().translation()[2]]
+        X_WCube = RigidTransform(R_WCube, p_WCube)
+        return X_WCube
+
+    def GetCubeConfig(self, context=None):
+        X_WCube = self.get_X_WCube(context)
+        R_WCube = X_WCube.rotation()
+        p_WCube = X_WCube.translation()
+        return np.array([p_WCube[0], p_WCube[1], R_WCube.ToRollPitchYaw().yaw_angle()])
+
+    def SetCubeConfig(self, q):
+        # x, y, theta to actual repr
+        X_WCube = self.CubeConfigToTransform(q)
+
+        #planar_cube_joint = self.plant.GetJointByName("cube_joint")
+        #planar_cube_joint.set_pose(self.context_plant, [q[0], q[1]], q[2])
+        
+        #cube = self.plant.GetModelInstanceByName("cube")
+        self.plant.SetFreeBodyPose(
+                self.context_plant, 
+                self.plant.GetBodyByName("base_link"), 
+                X_WCube
+        )
+
+        self.diagram.Publish(self.context_diagram)
+
+    def SetIiwaConfiguration(self, q_iiwa):
+        iiwa = self.plant.GetModelInstanceByName("iiwa")
+        self.plant.SetPositions(self.context_plant, iiwa, q_iiwa)
+        self.diagram.Publish(self.context_diagram)
+
+    def SetStationConfiguration(self, q_iiwa, q_cube):
+        self.SetIiwaConfiguration(q_iiwa)
+        self.SetCubeConfig(q_cube)
+
+        self.diagram.Publish(self.context_diagram)
+
+    def DrawStation(self, q_iiwa, q_cube):
+        if not self.is_visualizing:
+            print("not visualizing")
+        self.SetStationConfiguration(q_iiwa, q_cube)
+        self.diagram.Publish(self.context_diagram)
+
+    def SimulateStation(self, advance_to_time, realtime=False, default_context=None):
+        if self.is_visualizing:
+            self.visualizer.StartRecording(False)
+        if realtime:
+            self.simulator.set_target_realtime_rate(1.0)
+
+        if default_context is not None:
+            self.simulator.AdvanceTo(advance_to_time, default_context)
+        else:
+            self.simulator.AdvanceTo(advance_to_time)
+
+        if self.is_visualizing:
+            self.visualizer.PublishRecording()
+
+    def ExistsCollision(self):
+        query_object = self.query_output_port.Eval(self.context_scene_graph)
+        collision_pairs = query_object.ComputePointPairPenetration()
+
+        return len(collision_pairs) > 0
+
+    def get_X_WG(self):
+        X_WG = self.plant.CalcRelativeTransform(
+                self.context_plant,
+                frame_A=self.world_frame,
+                frame_B=self.gripper_frame
+        )
+        return X_WG
+
+    def get_X_WCube(self, context=None):
+        if context is None:
+            X_WCube = self.plant.CalcRelativeTransform(
+                    self.context_plant,
+                    frame_A=self.world_frame,
+                    frame_B=self.cube_frame
+            )
+        else:
+            X_WCube = self.plant.CalcRelativeTransform(
+                    context,
+                    frame_A=self.world_frame,
+                    frame_B=self.cube_frame
+            )
+        return X_WCube
+
+    def designPushPose(self, X_WContact):
+        p_GContact = [0, 0.09, 0.0]
+        R_GContact = RotationMatrix.MakeXRotation(np.pi/2)
+        X_GContact = RigidTransform(R_GContact, p_GContact)
+        X_ContactG = X_GContact.inverse()
+        X_WG = X_WContact @ X_ContactG
+        #return X_CubeContact, X_WG
+        return X_WG
+
+    def get_X_WContact(self, face_id):
+        # Convention for each face:
+        # Z/|\ 
+        #   | /Y - Y points inside the box
+        #   |/
+        #   -----> X
+        #
+        # 0-west, 1-south, 2-east, 3-north, 4-top 
+        # face_id refers to face of cube
+        p_CubeContact = [0,0,0]
+        R_WContact = RigidTransform()
+        # box is 0.075 x 0.05 x 0.05
+        box_x = 0.075
+        box_y = 0.05
+        box_z = 0.05
+        offset = 0.03
+        if face_id == 0:
+            p_CubeContact = [-box_x/2 - offset, 0, box_z/2]
+            R_CubeContact = RotationMatrix.MakeZRotation(3*np.pi/2)
+        elif face_id == 1:
+            p_CubeContact = [0, -box_y/2 - offset, box_z/2]
+            R_CubeContact = RotationMatrix.MakeZRotation(0)
+        elif face_id == 2:
+            p_CubeContact = [+box_x/2 + offset, 0, box_z/2]
+            R_CubeContact = RotationMatrix.MakeZRotation(np.pi/2)
+        elif face_id == 3:
+            p_CubeContact = [0, +box_y/2 + offset, box_z/2]
+            R_CubeContact = RotationMatrix.MakeZRotation(np.pi)
+        elif face_id == 4:
+            p_CubeContact = [0, 0, box_z + offset]
+            R_CubeContact = RotationMatrix.MakeXRotation(-np.pi/2)
+
+        X_CubeContact = RigidTransform(R_CubeContact, p_CubeContact)
+
+        X_WContact = self.get_X_WCube() @ X_CubeContact
+
+        return X_WContact
+
+    def visualize_frame(self, name, X_WF):
+        AddMeshcatTriad(self.meshcat, "pushing/"+name, length=0.15, radius=0.006, X_PT=X_WF)
+
+    ### pose version
+    def VisualizePushConfigSeq(self, push_q_seq):
+        wsg = self.plant.GetModelInstanceByName("wsg")
+        gripper = self.plant.GetBodyByName("body", wsg)
+        for i,push_q in enumerate(push_q_seq):
+            self.visualize_frame("pose_{i}".format(i=i), push_q)
+
+    ### config version
+    #def VisualizePushConfigSeq(self, push_q_seq):
+    #    wsg = self.plant.GetModelInstanceByName("wsg")
+    #    gripper = self.plant.GetBodyByName("body", wsg)
+    #    for i,push_q in enumerate(push_q_seq):
+    #        self.SetIiwaConfiguration(push_q)
+    #        pose = self.plant.EvalBodyPoseInWorld(self.context_plant, gripper)
+    #        self.visualize_frame("pose_{i}".format(i=i), pose)
+
+
